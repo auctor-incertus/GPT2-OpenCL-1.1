@@ -20,7 +20,7 @@
  *   --prompt TEXT      run one generation and exit
  *   --bench            run FP32 vs FP64 diagnostic at startup
  *
- * Results may wary depending on type of graphics run that will utilized by this program.
+ * Results may wary depending on type of graphics card that will utilized by this program.
  * Do not expect it to be absolutely perfect.
 
 */
