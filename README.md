@@ -127,7 +127,7 @@ Timing:
 ## Building
 
 ```bash
-gcc -O3 -lOpenCL -lm main.c tokenizer.c -o gpt2-opencl11
+gcc -O3 main.c tokenizer.c -o gpt2-opencl11 -lOpenCL -lm 
 ```
 
 ### Requirements
