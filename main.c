@@ -18,7 +18,12 @@
  *   --seed N           RNG seed (default: time(NULL))
  *   --greedy           shorthand for --temperature 0
  *   --prompt TEXT      run one generation and exit
- */
+ *   --bench            run FP32 vs FP64 diagnostic at startup
+ *
+ * Results may wary depending on type of graphics run that will utilized by this program.
+ * Do not expect it to be absolutely perfect.
+
+*/
 
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
@@ -65,13 +70,13 @@ static float    g_temperature  = 0.8f;
 static int      g_top_k        = 40;
 static float    g_rep_penalty  = 1.1f;
 static unsigned g_seed         = 0;
+static int      g_seed_set     = 0;
 static int      g_max_tokens   = 32;
 static int      g_min_tokens   = 1;
 static int      g_device_choice = -1;   /* -1 = auto-select fastest */
+static int      g_run_bench     = 0;
 
 /* ---------- Device info ---------- */
-typedef enum { FMT_FP32, FMT_FP64 } ComputeFormat;
-
 typedef struct {
     cl_device_id   device;
     cl_platform_id platform;
@@ -85,7 +90,6 @@ typedef struct {
     size_t         max_work_group_size;
     cl_bool        fp16_supported;
     cl_bool        fp64_supported;
-    ComputeFormat  best_format;
     double         quick_ms;     /* 256x256 FP32 matmul, for device ranking */
 } DeviceInfo;
 
@@ -95,11 +99,11 @@ static DeviceInfo  dev;             /* the selected device */
 
 /* ---------- Per-shape tuning (matvec decode path) ---------- */
 enum ShapeId {
-    SHAPE_ATTN_PROJ,   /* N = n_embd,       K = n_embd   */
-    SHAPE_QKV,         /* N = 3*n_embd,     K = n_embd   */
-    SHAPE_FFN1,        /* N = ffn_dim,      K = n_embd   */
-    SHAPE_FFN2,        /* N = n_embd,       K = ffn_dim  */
-    SHAPE_LM_HEAD,     /* N = padded_vocab, K = n_embd   */
+    SHAPE_ATTN_PROJ,
+    SHAPE_QKV,
+    SHAPE_FFN1,
+    SHAPE_FFN2,
+    SHAPE_LM_HEAD,
     SHAPE_COUNT
 };
 
@@ -160,7 +164,6 @@ static gpt2_tokenizer *tok = NULL;
 static int file_is_conv1d = 0;
 
 static cl_mem lm_head_weight = NULL;
-static int    lm_head_is_wte = 0;
 
 /* ---------- Preallocated inference workspaces ---------- */
 static cl_mem buf_hidden;
@@ -178,6 +181,9 @@ static cl_mem buf_partial;
 static cl_mem buf_scores;
 static cl_mem k_cache[MAX_LAYERS];
 static cl_mem v_cache[MAX_LAYERS];
+
+/* ---------- Host-side scratch ---------- */
+static float *g_logits_host = NULL;    /* size MAX_VOCAB */
 
 /* ---------- Utilities ---------- */
 #define CL_CHECK(err, msg) do { \
@@ -199,12 +205,6 @@ static inline void make_gws2(size_t out[2], size_t nx, size_t ny,
     out[1] = round_up(ny, lws[1]);
 }
 
-static void make_gws_mm(size_t gws[2], int M, int N)
-{
-    gws[0] = (size_t)((N + 63) / 64) * 16;
-    gws[1] = (size_t)((M + 63) / 64) * 16;
-}
-
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -213,11 +213,11 @@ static double now_sec(void) {
 
 static char *slurp(const char *path, int64_t *out_size) {
     FILE *fp = fopen(path, "rb");
-    if (!fp) { perror(path); return NULL; }
-    if (fseeko(fp, 0, SEEK_END) != 0) { perror("fseeko END"); fclose(fp); return NULL; }
+    if (!fp) return NULL;
+    if (fseeko(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
     off_t sz_off = ftello(fp);
-    if (sz_off < 0) { perror("ftello"); fclose(fp); return NULL; }
-    if (fseeko(fp, 0, SEEK_SET) != 0) { perror("fseeko SET"); fclose(fp); return NULL; }
+    if (sz_off < 0) { fclose(fp); return NULL; }
+    if (fseeko(fp, 0, SEEK_SET) != 0) { fclose(fp); return NULL; }
 
     size_t sz = (size_t)sz_off;
     char *buf = malloc(sz + 1);
@@ -234,16 +234,61 @@ static char *slurp(const char *path, int64_t *out_size) {
     return buf;
 }
 
+/* Try several locations for math.cl. */
+static char *find_math_cl(const char *model_dir, int64_t *out_size) {
+    char path[1024];
+    char *src;
+
+    /* 1. Current working directory. */
+    if (access("math.cl", R_OK) == 0) {
+        if ((src = slurp("math.cl", out_size)) != NULL) return src;
+    }
+
+    /* 2. Next to the model. */
+    if (model_dir) {
+        snprintf(path, sizeof(path), "%s/math.cl", model_dir);
+        if (access(path, R_OK) == 0) {
+            if ((src = slurp(path, out_size)) != NULL) return src;
+        }
+    }
+
+    /* 3. Next to the executable (Linux /proc/self/exe). */
+    char exe[1024];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            snprintf(path, sizeof(path), "%s/math.cl", exe);
+            if (access(path, R_OK) == 0) {
+                if ((src = slurp(path, out_size)) != NULL) return src;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int json_get_int_any(const char *json, const char *const *keys, int nkeys,
+                            int defval)
+{
+    for (int i = 0; i < nkeys; ++i) {
+        char pat[128];
+        snprintf(pat, sizeof(pat), "\"%s\"", keys[i]);
+        const char *p = strstr(json, pat);
+        if (!p) continue;
+        p = strchr(p, ':');
+        if (!p) continue;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        return atoi(p);
+    }
+    return defval;
+}
+
 static int json_get_int(const char *json, const char *key, int defval) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return defval;
-    p = strchr(p, ':');
-    if (!p) return defval;
-    p++;
-    while (*p == ' ' || *p == '\t') p++;
-    return atoi(p);
+    const char *keys[1] = { key };
+    return json_get_int_any(json, keys, 1, defval);
 }
 
 static void load_config(const char *dir) {
@@ -261,9 +306,14 @@ static void load_config(const char *dir) {
     cfg.n_layer    = json_get_int(json, "n_layer",    12);
     cfg.n_embd     = json_get_int(json, "n_embd",     768);
     cfg.n_head     = json_get_int(json, "n_head",     12);
-    cfg.n_ctx      = json_get_int(json, "n_ctx",      1024);
+    /* HF uses "n_positions" / "n_ctx"; OpenAI uses "n_ctx". */
+    {
+        const char *ctx_keys[2] = { "n_positions", "n_ctx" };
+        cfg.n_ctx = json_get_int_any(json, ctx_keys, 2, 1024);
+    }
     cfg.vocab_size = json_get_int(json, "vocab_size", 50257);
-    cfg.ffn_dim    = 4 * cfg.n_embd;
+    int inner = json_get_int(json, "n_inner", 0);
+    cfg.ffn_dim = (inner > 0) ? inner : 4 * cfg.n_embd;
     free(json);
 
     if (cfg.n_embd > MAX_EMBED_DIM || cfg.n_layer > MAX_LAYERS ||
@@ -282,10 +332,6 @@ static void load_config(const char *dir) {
 
 /* ============================================================
  * Device enumeration
- *
- * Every GPU on every platform is enumerated and benchmarked on a
- * 256x256 FP32 matmul.  The fastest is selected, unless --device N
- * forces a specific index.
  * ============================================================ */
 
 static double bench_device(cl_platform_id plat, cl_device_id d)
@@ -384,8 +430,6 @@ static void fill_device_info(DeviceInfo *d) {
     d->fp16_supported = (strstr(ext, "cl_khr_fp16") != NULL);
     d->fp64_supported = (strstr(ext, "cl_khr_fp64") != NULL);
     free(ext);
-
-    d->best_format = FMT_FP32;
 }
 
 static void enumerate_devices(void) {
@@ -481,21 +525,25 @@ static void select_device(void) {
  * OpenCL program setup
  * ============================================================ */
 
-static void init_opencl(void) {
+static void init_opencl(const char *model_dir) {
     cl_int err;
 
     ctx = clCreateContext(NULL, 1, &dev.device, NULL, NULL, &err);
     CL_CHECK(err, "context");
 
+    /* Profiling is not used at runtime; skip it (some drivers add per-launch cost). */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    queue = clCreateCommandQueue(ctx, dev.device, CL_QUEUE_PROFILING_ENABLE, &err);
+    queue = clCreateCommandQueue(ctx, dev.device, 0, &err);
 #pragma GCC diagnostic pop
     CL_CHECK(err, "queue");
 
     int64_t fsize = 0;
-    char *src = slurp("math.cl", &fsize);
-    if (!src) { perror("math.cl"); exit(1); }
+    char *src = find_math_cl(model_dir, &fsize);
+    if (!src) {
+        fprintf(stderr, "Cannot locate math.cl (tried cwd, model dir, exe dir).\n");
+        exit(EXIT_FAILURE);
+    }
 
     program = clCreateProgramWithSource(ctx, 1, (const char **)&src, NULL, &err);
     CL_CHECK(err, "program");
@@ -512,8 +560,7 @@ static void init_opencl(void) {
     }
     free(src);
 
-    /* matmul kernel is built separately by sweep_matmul_tile(). */
-    k_matmul       = NULL;
+    k_matmul       = NULL;   /* built by sweep_matmul_tile() */
     k_matvec       = clCreateKernel(program, "matvec",         &err); CL_CHECK(err, "matvec");
     k_layernorm    = clCreateKernel(program, "layernorm",      &err); CL_CHECK(err, "layernorm");
     k_gelu         = clCreateKernel(program, "gelu",           &err); CL_CHECK(err, "gelu");
@@ -541,12 +588,6 @@ static void init_opencl(void) {
 
 /* ============================================================
  * Matmul tile sweep
- *
- * The matmul kernel's tiling constants are compile-time.  To tune them
- * we build a standalone program containing only the matmul kernel,
- * with tile parameters injected as #defines.  Each candidate config is
- * built, benchmarked on a prefill-shaped workload, and the winner is
- * kept as k_matmul.
  * ============================================================ */
 
 static const char *MATMUL_SRC_FMT =
@@ -642,7 +683,8 @@ static const char *MATMUL_SRC_FMT =
 "    }\n"
 "}\n";
 
-static cl_kernel build_matmul_kernel(int bm, int bn, int bk, int tm, int tn)
+static cl_kernel build_matmul_kernel(int bm, int bn, int bk, int tm, int tn,
+                                     const char *label)
 {
     char src[8192];
     snprintf(src, sizeof src, MATMUL_SRC_FMT, bm, bn, bk, tm, tn);
@@ -650,9 +692,20 @@ static cl_kernel build_matmul_kernel(int bm, int bn, int bk, int tm, int tn)
     cl_int err;
     const char *sp = src;
     cl_program prog = clCreateProgramWithSource(ctx, 1, &sp, NULL, &err);
-    if (err != CL_SUCCESS) return NULL;
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "  [%s] clCreateProgramWithSource: err %d\n", label, err);
+        return NULL;
+    }
     err = clBuildProgram(prog, 1, &dev.device, NULL, NULL, NULL);
     if (err != CL_SUCCESS) {
+        size_t log_size = 0;
+        clGetProgramBuildInfo(prog, dev.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+        char *log = malloc(log_size + 1);
+        clGetProgramBuildInfo(prog, dev.device, CL_PROGRAM_BUILD_LOG,
+                              log_size, log, NULL);
+        log[log_size] = 0;
+        fprintf(stderr, "  [%s] build failed:\n%s\n", label, log);
+        free(log);
         clReleaseProgram(prog);
         return NULL;
     }
@@ -710,7 +763,8 @@ static void sweep_matmul_tile(void)
 
     for (int i = 0; i < ncfg; ++i) {
         cl_kernel k = build_matmul_kernel(cfgs[i].bm, cfgs[i].bn,
-                                          cfgs[i].bk, cfgs[i].tm, cfgs[i].tn);
+                                          cfgs[i].bk, cfgs[i].tm, cfgs[i].tn,
+                                          cfgs[i].name);
         if (!k) {
             printf("    %-18s : build failed\n", cfgs[i].name);
             continue;
@@ -785,7 +839,7 @@ static void sweep_matmul_tile(void)
 }
 
 /* ============================================================
- * Diagnostic format benchmark (FP32 vs FP64)
+ * Diagnostic format benchmark (opt-in via --bench)
  * ============================================================ */
 
 static void benchmark_formats(void) {
@@ -899,11 +953,11 @@ static void benchmark_formats(void) {
  * Per-shape matvec tuning
  *
  * Sweeps (lws, ks) on each distinct decode-time matvec shape and stores
- * the winner in tune_shapes[].  The LM head inherits FFN2's lws and
- * always uses ks=1 (N ≈ 50000 already provides plenty of parallelism).
+ * the winner in tune_shapes[].  GELU epilogue is applied to match the
+ * runtime behaviour of each shape.
  * ============================================================ */
 
-static int sweep_one_shape(int N, int K, int *out_lws, int *out_ks)
+static int sweep_one_shape(int N, int K, int with_gelu, int *out_lws, int *out_ks)
 {
     *out_lws = 128;
     *out_ks  = 1;
@@ -911,27 +965,37 @@ static int sweep_one_shape(int N, int K, int *out_lws, int *out_ks)
     if (N <= 0 || K <= 0 || (N & 3) != 0 || k_matvec4 == NULL) return -1;
 
     const int N4 = N >> 2;
-    cl_int err;
+    cl_int err = CL_SUCCESS;
     const size_t a_bytes = (size_t)K * sizeof(float);
     const size_t b_bytes = (size_t)K * (size_t)N * sizeof(float);
     const size_t c_bytes = (size_t)N * sizeof(float);
     const size_t p_bytes = (size_t)MAX_KSLICE * (size_t)N4 * sizeof(cl_float4);
 
-    cl_mem A = clCreateBuffer(ctx, CL_MEM_READ_ONLY,  a_bytes, NULL, &err);
-    cl_mem B = clCreateBuffer(ctx, CL_MEM_READ_ONLY,  b_bytes, NULL, &err);
-    cl_mem C = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, c_bytes, NULL, &err);
-    cl_mem P = clCreateBuffer(ctx, CL_MEM_READ_WRITE, p_bytes, NULL, &err);
-    if (err != CL_SUCCESS) return -1;
+    cl_mem A = NULL, B = NULL, C = NULL, P = NULL;
 
-    float *hostA = malloc(a_bytes);
-    float *hostB = malloc(b_bytes);
-    if (!hostA || !hostB) { free(hostA); free(hostB); return -1; }
-    for (int i = 0; i < K; ++i) hostA[i] = 0.01f;
-    for (int i = 0; i < K * N; ++i) hostB[i] = 0.01f;
-    clEnqueueWriteBuffer(queue, A, CL_TRUE, 0, a_bytes, hostA, 0, NULL, NULL);
-    clEnqueueWriteBuffer(queue, B, CL_TRUE, 0, b_bytes, hostB, 0, NULL, NULL);
-    free(hostA);
-    free(hostB);
+    A = clCreateBuffer(ctx, CL_MEM_READ_ONLY,  a_bytes, NULL, &err);
+    if (err != CL_SUCCESS) goto cleanup;
+    B = clCreateBuffer(ctx, CL_MEM_READ_ONLY,  b_bytes, NULL, &err);
+    if (err != CL_SUCCESS) goto cleanup;
+    C = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, c_bytes, NULL, &err);
+    if (err != CL_SUCCESS) goto cleanup;
+    P = clCreateBuffer(ctx, CL_MEM_READ_WRITE, p_bytes, NULL, &err);
+    if (err != CL_SUCCESS) goto cleanup;
+
+    {
+        float *hostA = malloc(a_bytes);
+        float *hostB = malloc(b_bytes);
+        if (!hostA || !hostB) {
+            free(hostA); free(hostB);
+            goto cleanup;
+        }
+        for (int i = 0; i < K; ++i) hostA[i] = 0.01f;
+        for (int i = 0; i < K * N; ++i) hostB[i] = 0.01f;
+        clEnqueueWriteBuffer(queue, A, CL_TRUE, 0, a_bytes, hostA, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, B, CL_TRUE, 0, b_bytes, hostB, 0, NULL, NULL);
+        free(hostA);
+        free(hostB);
+    }
 
     static const int cand_lws[] = { 32, 64, 128, 256 };
     static const int cand_ks[]  = { 1, 2, 4, 8 };
@@ -953,7 +1017,7 @@ static int sweep_one_shape(int N, int K, int *out_lws, int *out_ks)
             if (ks > 1 && !have_splitk) continue;
             if (ks > MAX_KSLICE) continue;
 
-            cl_int Ni = N, Ki = K, Ks = ks, G = 0;
+            cl_int Ni = N, Ki = K, Ks = ks, G = with_gelu;
 
             clSetKernelArg(k_matvec4, 0, sizeof(cl_mem), &A);
             clSetKernelArg(k_matvec4, 1, sizeof(cl_mem), &B);
@@ -1020,11 +1084,18 @@ static int sweep_one_shape(int N, int K, int *out_lws, int *out_ks)
     *out_lws = best_lws;
     *out_ks  = best_ks;
 
-    clReleaseMemObject(A);
-    clReleaseMemObject(B);
-    clReleaseMemObject(C);
-    clReleaseMemObject(P);
+    if (A) clReleaseMemObject(A);
+    if (B) clReleaseMemObject(B);
+    if (C) clReleaseMemObject(C);
+    if (P) clReleaseMemObject(P);
     return 0;
+
+cleanup:
+    if (A) clReleaseMemObject(A);
+    if (B) clReleaseMemObject(B);
+    if (C) clReleaseMemObject(C);
+    if (P) clReleaseMemObject(P);
+    return -1;
 }
 
 static void benchmark_tuning_shapes(void)
@@ -1032,24 +1103,27 @@ static void benchmark_tuning_shapes(void)
     const int E = cfg.n_embd;
     const int F = cfg.ffn_dim;
     const int T = 3 * E;
+    const int V = padded_vocab;
 
-    struct { int shape; int N; int K; const char *name; } table[] = {
-        { SHAPE_ATTN_PROJ, E, E, "attn_proj" },
-        { SHAPE_QKV,       T, E, "qkv"       },
-        { SHAPE_FFN1,      F, E, "ffn1"      },
-        { SHAPE_FFN2,      E, F, "ffn2"      },
+    struct { int shape; int N; int K; int gelu; const char *name; } table[] = {
+        { SHAPE_ATTN_PROJ, E, E, 0, "attn_proj" },
+        { SHAPE_QKV,       T, E, 0, "qkv"       },
+        { SHAPE_FFN1,      F, E, 1, "ffn1"      },
+        { SHAPE_FFN2,      E, F, 0, "ffn2"      },
+        { SHAPE_LM_HEAD,   V, E, 0, "lm_head"   },
     };
     const int ntab = (int)(sizeof(table) / sizeof(table[0]));
 
     printf("  Per-shape tuning:\n");
 
     for (int i = 0; i < ntab; ++i) {
-        int lws = 128, ks = 4;
-        int rc = sweep_one_shape(table[i].N, table[i].K, &lws, &ks);
+        int lws = 128, ks = 1;
+        int rc = sweep_one_shape(table[i].N, table[i].K, table[i].gelu, &lws, &ks);
         if (rc != 0) {
             printf("    %-10s N=%d K=%d : skipped\n",
                    table[i].name, table[i].N, table[i].K);
-            lws = 128; ks = 1;
+            lws = 128;
+            ks  = (k_matvec4_sk && k_reduce_partial) ? 4 : 1;
         }
         tune_shapes[table[i].shape].N   = table[i].N;
         tune_shapes[table[i].shape].K   = table[i].K;
@@ -1058,14 +1132,6 @@ static void benchmark_tuning_shapes(void)
         printf("    %-10s N=%-5d K=%-5d -> lws=%3d ks=%d\n",
                table[i].name, table[i].N, table[i].K, lws, ks);
     }
-
-    tune_shapes[SHAPE_LM_HEAD].N   = padded_vocab;
-    tune_shapes[SHAPE_LM_HEAD].K   = E;
-    tune_shapes[SHAPE_LM_HEAD].lws = tune_shapes[SHAPE_FFN2].lws;
-    tune_shapes[SHAPE_LM_HEAD].ks  = 1;
-    printf("    %-10s N=%-5d K=%-5d -> lws=%3d ks=%d (inherited)\n",
-           "lm_head", tune_shapes[SHAPE_LM_HEAD].N, E,
-           tune_shapes[SHAPE_LM_HEAD].lws, 1);
 }
 
 /* ============================================================
@@ -1316,7 +1382,6 @@ static void load_model(const char *dir) {
         lm_head_weight = make_padded_lm_head(src, cfg.n_embd,
                                              cfg.vocab_size, padded_vocab);
         free(src);
-        lm_head_is_wte = 0;
         printf("LM head: tied to wte.weight (padded [%d,%d])\n",
                cfg.n_embd, padded_vocab);
     } else {
@@ -1344,12 +1409,39 @@ static void load_model(const char *dir) {
             exit(EXIT_FAILURE);
         }
         free(src);
-        lm_head_is_wte = 0;
         printf("LM head: separate (padded [%d,%d])\n",
                cfg.n_embd, padded_vocab);
     }
 
     printf("Model VRAM: %.1f MiB\n", gpu_bytes_used / 1048576.0);
+}
+
+/* Release everything allocated by load_model(). */
+static void release_model(void) {
+    if (model.wte) clReleaseMemObject(model.wte);
+    if (model.wpe) clReleaseMemObject(model.wpe);
+    for (int l = 0; l < cfg.n_layer; ++l) {
+        if (model.ln1_w[l])       clReleaseMemObject(model.ln1_w[l]);
+        if (model.ln1_b[l])       clReleaseMemObject(model.ln1_b[l]);
+        if (model.qkv_w[l])       clReleaseMemObject(model.qkv_w[l]);
+        if (model.qkv_b[l])       clReleaseMemObject(model.qkv_b[l]);
+        if (model.attn_proj_w[l]) clReleaseMemObject(model.attn_proj_w[l]);
+        if (model.attn_proj_b[l]) clReleaseMemObject(model.attn_proj_b[l]);
+        if (model.ln2_w[l])       clReleaseMemObject(model.ln2_w[l]);
+        if (model.ln2_b[l])       clReleaseMemObject(model.ln2_b[l]);
+        if (model.ffn1_w[l])      clReleaseMemObject(model.ffn1_w[l]);
+        if (model.ffn1_b[l])      clReleaseMemObject(model.ffn1_b[l]);
+        if (model.ffn2_w[l])      clReleaseMemObject(model.ffn2_w[l]);
+        if (model.ffn2_b[l])      clReleaseMemObject(model.ffn2_b[l]);
+    }
+    if (model.lnf_w) clReleaseMemObject(model.lnf_w);
+    if (model.lnf_b) clReleaseMemObject(model.lnf_b);
+    memset(&model, 0, sizeof model);
+
+    if (lm_head_weight) {
+        clReleaseMemObject(lm_head_weight);
+        lm_head_weight = NULL;
+    }
 }
 
 /* ============================================================
@@ -1392,6 +1484,9 @@ static void preallocate_buffers(void) {
         v_cache[l] = clCreateBuffer(ctx, CL_MEM_READ_WRITE, S * E * sizeof(float), NULL, &err);
         CL_CHECK(err, "v_cache");
     }
+
+    g_logits_host = malloc((size_t)MAX_VOCAB * sizeof(float));
+    if (!g_logits_host) { fprintf(stderr, "OOM logits host buffer\n"); exit(EXIT_FAILURE); }
 }
 
 static void release_buffers(void) {
@@ -1412,6 +1507,8 @@ static void release_buffers(void) {
         clReleaseMemObject(k_cache[l]);
         clReleaseMemObject(v_cache[l]);
     }
+    free(g_logits_host);
+    g_logits_host = NULL;
 }
 
 /* ============================================================
@@ -1771,19 +1868,17 @@ static float kth_largest(const float *a, int n, int k) {
 }
 
 /* Sample the next token.  If forbid_eos is nonzero, the EOS logit is
- * masked to -infinity before sampling so the model cannot stop yet.
- * Used to enforce a minimum generation length. */
+ * masked to -infinity before sampling so the model cannot stop yet. */
 static int sample_next_token(const int *context_ids, int n_context,
                              int forbid_eos)
 {
-    float *logits = malloc((size_t)cfg.vocab_size * sizeof(float));
-    if (!logits) { fprintf(stderr, "OOM\n"); exit(EXIT_FAILURE); }
+    float *logits = g_logits_host;
+    if (!logits) { fprintf(stderr, "logits buffer not initialized\n"); exit(EXIT_FAILURE); }
+
     CL_CHECK(clEnqueueReadBuffer(queue, buf_logits, CL_TRUE, 0,
                                  (size_t)cfg.vocab_size * sizeof(float),
                                  logits, 0, NULL, NULL), "read logits");
 
-    /* Mask EOS before rep-penalty / temperature / top-k so the sampler
-     * cannot pick it, regardless of the other settings. */
     if (forbid_eos && EOS_TOKEN_ID < cfg.vocab_size)
         logits[EOS_TOKEN_ID] = -1e30f;
 
@@ -1805,7 +1900,6 @@ static int sample_next_token(const int *context_ids, int n_context,
         float bv = logits[0];
         for (int i = 1; i < cfg.vocab_size; ++i)
             if (logits[i] > bv) { bv = logits[i]; best = i; }
-        free(logits);
         return best;
     }
 
@@ -1841,8 +1935,29 @@ static int sample_next_token(const int *context_ids, int n_context,
         acc += logits[i];
         if (acc >= r) { chosen = i; break; }
     }
-    free(logits);
     return chosen;
+}
+
+/* ============================================================
+ * Incremental UTF-8 output
+ *
+ * Every time a token is generated we re-decode the *full* sequence of
+ * generated tokens and emit only the bytes beyond what we have already
+ * written.  This avoids splitting multi-byte UTF-8 characters across
+ * token boundaries (the original per-token decode bug).
+ * ============================================================ */
+
+static size_t g_printed_len = 0;
+
+static void emit_new_bytes(const int *gen_ids, int n_gen) {
+    static char tmp[32768];
+    int n = gpt2_decode(tok, (int *)gen_ids, n_gen, tmp, sizeof(tmp));
+    if (n < 0) return;
+    if ((size_t)n > g_printed_len) {
+        fwrite(tmp + g_printed_len, 1, (size_t)n - g_printed_len, stdout);
+        fflush(stdout);
+        g_printed_len = (size_t)n;
+    }
 }
 
 /* ============================================================
@@ -1875,8 +1990,11 @@ int main(int argc, char **argv) {
             if (g_min_tokens < 1) g_min_tokens = 1;
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             g_seed = (unsigned)strtoul(argv[++i], NULL, 10);
+            g_seed_set = 1;
         } else if (strcmp(argv[i], "--greedy") == 0) {
             g_temperature = 0.0f;
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            g_run_bench = 1;
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt_arg = argv[++i];
         } else if (!model_dir && !list_devices) {
@@ -1897,7 +2015,8 @@ int main(int argc, char **argv) {
             "  --min-tokens N     forbid EOS for the first N tokens (default 1)\n"
             "  --seed N           RNG seed (default: time(NULL))\n"
             "  --greedy           shorthand for --temperature 0\n"
-            "  --prompt TEXT      run one generation and exit\n",
+            "  --prompt TEXT      run one generation and exit\n"
+            "  --bench            run FP32 vs FP64 diagnostic at startup\n",
             argv[0], argv[0]);
         return EXIT_FAILURE;
     }
@@ -1907,7 +2026,7 @@ int main(int argc, char **argv) {
     if (list_devices) return EXIT_SUCCESS;
     select_device();
 
-    if (g_seed == 0) g_seed = (unsigned)time(NULL);
+    if (!g_seed_set) g_seed = (unsigned)time(NULL);
     srand(g_seed);
 
     if (g_temperature <= 0.0f) {
@@ -1919,14 +2038,18 @@ int main(int argc, char **argv) {
                "min_tokens=%d seed=%u\n",
                g_temperature, g_top_k, g_rep_penalty, g_min_tokens, g_seed);
     }
+    if (g_top_k > MAX_TOPK) {
+        fprintf(stderr, "Warning: top-k clamped from %d to %d (MAX_TOPK).\n",
+                g_top_k, MAX_TOPK);
+    }
 
     /* Config first so the shape table knows n_embd / ffn_dim. */
     load_config(model_dir);
 
-    init_opencl();
+    init_opencl(model_dir);
     sweep_matmul_tile();
     benchmark_tuning_shapes();
-    benchmark_formats();
+    if (g_run_bench) benchmark_formats();
 
     load_model(model_dir);
     preallocate_buffers();
@@ -1946,6 +2069,7 @@ int main(int argc, char **argv) {
     const int MIN_NEW  = g_min_tokens;
 
     char prompt[1024];
+
     do {
         if (interactive) {
             printf("> ");
@@ -1965,29 +2089,30 @@ int main(int argc, char **argv) {
         }
 
         int input_ids[MAX_SEQ_LEN];
-        int prompt_len = gpt2_encode(tok, prompt, input_ids, MAX_SEQ_LEN);
+        /* Leave at least one slot free for a generated token. */
+        int prompt_len = gpt2_encode(tok, prompt, input_ids, MAX_SEQ_LEN - 1);
         if (prompt_len <= 0) {
             if (!interactive) return EXIT_FAILURE;
             continue;
         }
         int seq_len = prompt_len;
 
+        /* Track only the generated tokens so the incremental decoder
+         * is unaffected by the prompt. */
+        int gen_ids[MAX_SEQ_LEN];
+        int n_gen = 0;
+        g_printed_len = 0;
+
         double t_start = now_sec();
 
         prefill(input_ids, seq_len);
 
-        /* First sampled token: mask EOS if the caller requested a
-         * minimum response length. */
-        int next = sample_next_token(input_ids, seq_len,
-                                     /*forbid_eos=*/0 < MIN_NEW);
+        int next = sample_next_token(input_ids, seq_len, /*forbid_eos=*/0 < MIN_NEW);
         input_ids[seq_len++] = next;
 
-        char dbuf[256];
-        int dn = 0;
         if (next != EOS) {
-            dn = gpt2_decode(tok, &next, 1, dbuf, sizeof(dbuf));
-            if (dn > 0) fwrite(dbuf, 1, (size_t)dn, stdout);
-            fflush(stdout);
+            gen_ids[n_gen++] = next;
+            emit_new_bytes(gen_ids, n_gen);
         }
 
         double t_first = now_sec();
@@ -2002,7 +2127,6 @@ int main(int argc, char **argv) {
             double t_step0 = now_sec();
             decode(input_ids[seq_len - 1], seq_len - 1);
 
-            /* Mask EOS while we are still below the minimum length. */
             int forbid_eos = (generated < MIN_NEW);
             next = sample_next_token(input_ids, seq_len, forbid_eos);
             input_ids[seq_len++] = next;
@@ -2016,9 +2140,8 @@ int main(int argc, char **argv) {
                 break;
             }
 
-            dn = gpt2_decode(tok, &next, 1, dbuf, sizeof(dbuf));
-            if (dn > 0) fwrite(dbuf, 1, (size_t)dn, stdout);
-            fflush(stdout);
+            gen_ids[n_gen++] = next;
+            emit_new_bytes(gen_ids, n_gen);
 
             if (verbose) {
                 fprintf(stderr, "[%d: %.3fs]\n", generated - 1,
@@ -2067,12 +2190,11 @@ int main(int argc, char **argv) {
     clReleaseContext(ctx);
     gpt2_tokenizer_free(tok);
     tok = NULL;
-    if (!lm_head_is_wte && lm_head_weight) clReleaseMemObject(lm_head_weight);
     release_buffers();
+    release_model();
     if (st_fp) fclose(st_fp);
     free(st_header);
     free(st_file.tensors);
     free(st_file.metadata);
     return EXIT_SUCCESS;
 }
-
