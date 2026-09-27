@@ -1,7 +1,7 @@
 > [!NOTE]
 > This repository has been vibe-coded with DeepSeek.
 
-# gpt2-opencl11
+# GPT2-OpenCL-1.1
 
 **Hardware-agnostic adaptive GPT-2 inference for ancient outdated OpenCL 1.1 devices**
 
